@@ -1,0 +1,21 @@
+[package]
+name = "sigiltty-watcher"
+version = "0.1.0"
+edition = "2021"
+description = "Server-side herdr agent watcher for SigilTTY offline push (docs/PROTOCOL.md §9)"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hpke = { version = "0.12", default-features = false, features = ["alloc", "x25519"] }
+base64 = "0.22"
+rand = "0.8"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+libc = "0.2"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
+codegen-units = 1
