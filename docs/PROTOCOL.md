@@ -61,10 +61,12 @@ POST /v1/events
 { "events": [ { "routingID": "...", "secret": "...",
                 "collapseKey": "...", "ts": <unix seconds>,
                 "ciphertext": "<base64>" }, ... ] }   // ≤ 16 entries
-→ 200 { "results": [ "sent" | "rateLimited" | "unknownRouting" | "badSecret" | "invalid", ... ] }
+→ 200 { "results": [ "sent" | "rateLimited" | "unknownRouting" | "badSecret" | "invalid" | "sendFailed", ... ] }
 ```
 
 Per-entry validation, in order: secret hash matches; `|now − ts| ≤ 300 s` (replay window); `collapseKey` ≤ 64 ASCII chars; rate limits (§7). Entries fail independently — one bad device never blocks the others. A watcher fans one agent event out as N entries, one per device in its config, each sealed to that device's public key.
+
+`sendFailed` is a transient APNs/network failure: the watcher may retry that entry after backoff. Only `sent` advances the per-pane rate-limit clock, so a retry is never blocked by its own failed attempt.
 
 APNs `410 Unregistered` on delivery → the relay deletes the registration; subsequent events return `unknownRouting`.
 
@@ -79,7 +81,7 @@ apns-collapse-id: <collapseKey>
   "v": 1, "e": "<ciphertext base64>" }
 ```
 
-The `aps.alert` text is the **fallback** — shown only if the NSE fails (decryption error, missing key, extension timeout). The NSE decrypts `e` and rewrites title/subtitle/body per §5. APNs host follows the registration's `apnsEnvironment` (`api.push.apple.com` / `api.sandbox.push.apple.com`).
+The `aps.alert` text is the **fallback** — shown only if the NSE fails (decryption error, missing key, extension timeout). The NSE decrypts `e` and rewrites title/subtitle/body per §5. APNs host follows the registration's `apnsEnvironment` (`api.push.apple.com` / `api.sandbox.push.apple.com`). The relay sets `apns-expiration = ts + 21600` (6 h): a stale agent alert must not surface a day later; within the window, collapse-id replacement handles supersession.
 
 ## 5. Encrypted event payload
 

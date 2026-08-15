@@ -9,7 +9,7 @@ SigilTTY Relay is the offline-push pipeline for SigilTTY (sibling repo): a Rust 
 ## Layout
 
 - `docs/PROTOCOL.md` — **the normative single source**. Registration/renew/events API, HPKE envelope, APNs mapping, server config schema, watcher behavior contract, limits.
-- `relay/` — Cloudflare Workers + D1 (TypeScript). *(pending)*
+- `relay/` — Hono app (TypeScript). `src/app.ts` is runtime-agnostic; runtime specifics live ONLY in the entries: `src/index.ts` (Cloudflare Workers, D1, cron purge) and `src/node.ts` (self-hosted Node ≥ 24, `node:sqlite`, interval purge, undici `allowH2` fetch — **APNs is HTTP/2-only**, Node's built-in fetch cannot reach it). Persistence hides behind the `RelayStore` seam (`store/d1.ts` / `store/sqlite.ts`, both applying `schema.sql`); policy (TTLs, limits) stays in the app, drivers are dumb. Commands: `pnpm test` (vitest: pure pieces + endpoint flow over `:memory:` sqlite), `pnpm typecheck` (two tsconfigs — workers-types and @types/node must both pass; the two type worlds conflict, hence the entry/driver file splits in `tsconfig*.json`).
 - `watcher/` — Rust, static musl binaries for `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`. *(pending)*
 
 ## Invariants (violation = broken devices in the field)
@@ -20,6 +20,7 @@ SigilTTY Relay is the offline-push pipeline for SigilTTY (sibling repo): a Rust 
 - **Collapse key format (`herdr-<serverID>-<paneID>`) is an app-side contract** — it doubles as the app's local notification identifier for banner replacement. Change it in the SigilTTY repo first or not at all.
 - **Debounce lives here** (watcher hysteresis + relay rate limits). The app does no client-side flap filtering — four device-verified failures stand behind that (SigilTTY design doc §1). Don't move it back.
 - **The watcher never notifies about itself**: exits are silent, recovery is the app's per-connection health check.
+- **Only a successful APNs send advances the per-pane rate-limit clock** — a watcher retry after `sendFailed` must never be blocked by its own failed attempt (pinned by `relay/test/app.test.ts`).
 
 ## Git Commit Message Format
 

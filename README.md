@@ -9,7 +9,7 @@ Design and decision record live in the SigilTTY repo: `docs/design/herdr-offline
 | Component | Path | Stack | Status |
 |---|---|---|---|
 | Protocol v1 | `docs/PROTOCOL.md` | — | **defined** |
-| Relay | `relay/` | Cloudflare Workers + D1 | pending |
+| Relay | `relay/` | Hono — Workers + D1, or self-hosted Node + `node:sqlite` | **implemented** (deploy pending) |
 | Watcher | `watcher/` | Rust (static musl binaries) | pending |
 | Bootstrap + CI | `scripts/`, `.github/` | — | pending |
 

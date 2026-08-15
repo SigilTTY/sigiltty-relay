@@ -1,0 +1,21 @@
+# SigilTTY relay — Cloudflare Workers + D1 (docs/PROTOCOL.md is normative).
+# Deploy runbook: relay/README.md. APNS_PRIVATE_KEY is a secret
+# (`wrangler secret put APNS_PRIVATE_KEY`), never a var.
+
+name = "sigiltty-relay"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sigiltty-relay"
+database_id = "TBD-run-wrangler-d1-create"
+
+[vars]
+APNS_TEAM_ID = "TBD"
+APNS_KEY_ID = "TBD"
+APNS_TOPIC = "com.sigiltty.shell"
+
+# Daily purge of expired registrations and stale rate-limit rows.
+[triggers]
+crons = ["17 4 * * *"]
