@@ -103,16 +103,18 @@ A real banner on a real device needs a device token, which arrives with the app-
 
 ## Reading logs and stored times
 
-Every relay log line opens with an ISO-8601 UTC instant and a level:
+Every relay log line opens with an ISO-8601 instant carrying an explicit UTC offset, then a level:
 
 ```
 2026-08-15T11:06:07.784Z INFO  sigiltty-relay listening on :8788
 2026-08-15T11:06:07.785Z WARN  apns rejected: 403 InvalidProviderToken
 ```
 
-UTC rather than local time: a Worker isolate has no meaningful timezone, and the line usually has to be lined up against an APNs response or a watcher log from elsewhere. `pnpm wrangler tail` streams them from the deployed Worker; the self-hosted entry writes them to stdout. Lines carry status codes, reasons and counts — never a device token, collapse key or envelope.
+The offset is the host's own, so a self-hosted relay reads in the timezone its box is set to (`2026-08-15T19:06:07.784+08:00`). **On Workers it is always `Z`** — the runtime pins isolates to UTC regardless of where the Worker was deployed from, so the deployed relay prints exactly what it printed before offsets existed. Writing the offset into the line is what makes mixed sources safe to read: a watcher line at `+08:00` and a relay line at `Z` need one subtraction, and the line says how much. Milliseconds are kept because two sends inside one second are ordinary and their order is usually the thing being debugged.
 
-Times in the database are stored as unix seconds, since every read of one is a comparison, a range delete or a bucket key. Each is mirrored by a generated `*_utc` column rendering the same instant in the same format as the logs:
+`pnpm wrangler tail` streams these from the deployed Worker; the self-hosted entry writes them to stdout. Lines carry status codes, reasons and counts — never a device token, collapse key or envelope.
+
+Times in the database are stored as unix seconds, since every read of one is a comparison, a range delete or a bucket key. Each is mirrored by a generated `*_utc` column — always UTC, and unlike the log line it cannot be anything else: D1's clock is UTC, and SQLite rejects `'localtime'` inside a generated column outright (it demands a deterministic expression). Second precision, `Z` suffix, byte-identical to a log line from a UTC host:
 
 ```bash
 pnpm wrangler d1 execute sigiltty-relay --remote --command \
