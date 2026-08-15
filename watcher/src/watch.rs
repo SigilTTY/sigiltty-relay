@@ -4,12 +4,14 @@
 //! (the app does no client-side filtering; four device-verified failures
 //! stand behind that) — and the awareness model deciding what reports.
 //!
-//! Awareness model: `last_reported` is the status the user is presumed
-//! aware of for this agent INCARNATION — the run's seed (screen was in
-//! front of them at deploy time) or the last pushed status. A stable
-//! →blocked/→done reports only when it differs from it; a stable missing
-//! resets it (a restarted agent is a new incarnation, so its appearance
-//! reports — the hand-started-agent-blocks-on-startup case).
+//! What reports: a STABLE transition INTO blocked or done, where "stable"
+//! means it survived the hysteresis window. The window is the entire
+//! flap defense — so no further dedup sits on top of it, because the most
+//! common real pattern is blocked → (answered) → working → blocked again,
+//! and a "same status as last time" filter swallows exactly that. Two
+//! silences remain: the run's very first observation (the seed — at deploy
+//! time the screen was in front of the user), and a pane with no agent,
+//! whose later appearance in a notifiable state does report.
 //!
 //! The remote exec is injected, so the whole loop is scripted-unit-tested;
 //! only the process-spawning Remote at the bottom needs a live herdr.
@@ -59,9 +61,10 @@ pub struct WatchHooks<'a> {
 
 pub fn run(remote: &dyn Remote, timing: &Timing, hooks: &mut WatchHooks) {
     // Last STABLE state; None = no agent on the pane (or not yet observed).
+    // The last STABLE state; None = no agent on the pane. Transitions are
+    // measured against this, never against what was last reported (see the
+    // module header).
     let mut current: Option<AgentStatus> = None;
-    // See the awareness model in the module header.
-    let mut last_reported: Option<AgentStatus> = None;
     let mut seeded = false;
     let mut missing_backoff = timing.missing_start;
     let mut failures: usize = 0;
@@ -73,8 +76,14 @@ pub fn run(remote: &dyn Remote, timing: &Timing, hooks: &mut WatchHooks) {
         }
         match armed {
             WaitOutcome::TimedOut => {
-                // Heartbeat: one quiet period, re-arm unchanged.
+                // Heartbeat: one quiet period, re-arm unchanged. Logged
+                // because it is the only proof the loop is still turning —
+                // "no news" would otherwise be indistinguishable from a dead
+                // watcher, and the watcher reports nothing about itself.
                 failures = 0;
+                (hooks.log)(&format!(
+                    "heartbeat (state: {})",
+                    current.map(|s| s.as_str()).unwrap_or("no agent")));
             }
             WaitOutcome::Failure(reason) => {
                 if !backoff_or_give_up(&reason, &mut failures, timing, hooks) {
@@ -83,7 +92,8 @@ pub fn run(remote: &dyn Remote, timing: &Timing, hooks: &mut WatchHooks) {
             }
             WaitOutcome::Missing => {
                 failures = 0;
-                apply_missing(&mut current, &mut last_reported, &mut seeded);
+                (hooks.log)("no agent on this pane");
+                apply_missing(&mut current, &mut seeded);
                 (hooks.sleep)(missing_backoff);
                 missing_backoff = (missing_backoff * 2).min(timing.missing_cap);
             }
@@ -93,21 +103,32 @@ pub fn run(remote: &dyn Remote, timing: &Timing, hooks: &mut WatchHooks) {
                 match settle(remote, first, timing, hooks) {
                     Settled::Stable(agent) => {
                         let status = agent.status;
+                        let previous = current;
+                        current = Some(status);
                         if !seeded {
-                            // The run's first observation seeds silently.
+                            // The run's first observation seeds silently: at
+                            // deploy time the screen was in front of the user.
                             seeded = true;
-                            current = Some(status);
-                            last_reported = Some(status);
+                            (hooks.log)(&format!("armed at {}", status.as_str()));
                             continue;
                         }
-                        current = Some(status);
-                        if status.notifiable() && last_reported != Some(status) {
-                            last_reported = Some(status);
+                        if previous == Some(status) {
+                            // Settled back where it started — a flap that
+                            // outlived one window but changed nothing.
+                            (hooks.log)(&format!("settled back at {}", status.as_str()));
+                            continue;
+                        }
+                        let from = previous.map(|s| s.as_str()).unwrap_or("none");
+                        if status.notifiable() {
+                            (hooks.log)(&format!("{from} -> {}: reporting", status.as_str()));
                             (hooks.report)(&agent);
+                        } else {
+                            (hooks.log)(&format!("{from} -> {}", status.as_str()));
                         }
                     }
                     Settled::Missing => {
-                        apply_missing(&mut current, &mut last_reported, &mut seeded);
+                        (hooks.log)("no agent on this pane");
+                        apply_missing(&mut current, &mut seeded);
                         (hooks.sleep)(missing_backoff);
                         missing_backoff = (missing_backoff * 2).min(timing.missing_cap);
                     }
@@ -154,16 +175,12 @@ fn settle(
     }
 }
 
-fn apply_missing(
-    current: &mut Option<AgentStatus>,
-    last_reported: &mut Option<AgentStatus>,
-    seeded: &mut bool,
-) {
+/// Missing itself never reports, but it does count as an observation: the
+/// pane's next agent is a new incarnation, so its appearance in a notifiable
+/// state IS an event (a hand-started agent blocking on its startup prompt).
+fn apply_missing(current: &mut Option<AgentStatus>, seeded: &mut bool) {
     *seeded = true;
     *current = None;
-    // Awareness reset: the incarnation is over — a later appearance in a
-    // notifiable state must report. Missing itself never does.
-    *last_reported = None;
 }
 
 /// True = keep going (slept a backoff); false = retries exhausted, the
@@ -279,12 +296,29 @@ mod tests {
         assert_eq!(reported, Vec::<AgentStatus>::new());
     }
 
+    /// The most common real pattern, and the one an over-eager dedup eats:
+    /// the user answers the agent's question, it works for a while, then it
+    /// asks again. That second blocked is a NEW question and must report,
+    /// even though the run was seeded blocked.
     #[test]
-    fn reblock_after_a_working_episode_is_suppressed_by_awareness() {
+    fn reblock_after_a_working_episode_reports() {
         let (reported, _) = run_script(vec![
-            agent(Blocked), WaitOutcome::TimedOut,  // seed: blocked (user saw it)
-            agent(Working), WaitOutcome::TimedOut,  // silent (not notifiable)
-            agent(Blocked), WaitOutcome::TimedOut,  // same status the user knows
+            agent(Blocked), WaitOutcome::TimedOut,  // seed: blocked, silent
+            agent(Working), WaitOutcome::TimedOut,  // answered; not notifiable
+            agent(Blocked), WaitOutcome::TimedOut,  // asks again → report
+        ]);
+        assert_eq!(reported, vec![Blocked]);
+    }
+
+    /// The flap defense lives in the hysteresis window, not in a
+    /// same-status filter: a candidate that wanders and comes back reports
+    /// nothing, while a settled round trip does.
+    #[test]
+    fn a_state_that_settles_back_where_it_started_is_silent() {
+        let (reported, _) = run_script(vec![
+            agent(Blocked), WaitOutcome::TimedOut, // seed: blocked
+            agent(Done),                            // wanders…
+            agent(Blocked), WaitOutcome::TimedOut,  // …and settles back at blocked
         ]);
         assert_eq!(reported, Vec::<AgentStatus>::new());
     }

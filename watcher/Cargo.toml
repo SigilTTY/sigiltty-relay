@@ -1,6 +1,6 @@
 [package]
 name = "sigiltty-watcher"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Server-side herdr agent watcher for SigilTTY offline push (docs/PROTOCOL.md §9)"
 license = "MIT"

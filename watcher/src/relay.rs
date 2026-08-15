@@ -113,6 +113,7 @@ impl RelayClient {
             }
             match self.post(&pending) {
                 Ok(results) => {
+                    log(&format!("relay accepted {} entr(ies): {}", results.len(), results.join(",")));
                     let mut retry = Vec::new();
                     for (entry, result) in pending.iter().zip(results.iter()) {
                         match result.as_str() {
