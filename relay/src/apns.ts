@@ -115,7 +115,10 @@ export function createApnsSender(credentials: ApnsCredentials, fetchImpl?: Fetch
           },
           body: buildPayload(ciphertext),
         })
-      } catch {
+      } catch (error) {
+        // Transport-level failure (TLS, DNS, no HTTP/2). Worth a line: an
+        // opaque sendFailed with no reason is very expensive to debug.
+        console.warn(`apns request failed: ${error instanceof Error ? error.message : String(error)}`)
         return 'sendFailed'
       }
       if (response.ok) return 'sent'
@@ -124,6 +127,10 @@ export function createApnsSender(credentials: ApnsCredentials, fetchImpl?: Fetch
         .then((b) => (b as { reason?: string } | null)?.reason)
         .catch(() => undefined)
       if (response.status === 410 || (reason !== undefined && GONE_REASONS.has(reason))) return 'gone'
+      // Config-level rejections land here (InvalidProviderToken from a wrong
+      // team/key, TopicDisallowed, ExpiredProviderToken from clock skew).
+      // Status + reason only — never the token, never the envelope.
+      console.warn(`apns rejected: ${response.status} ${reason ?? '(no reason)'}`)
       return 'sendFailed'
     },
   }
