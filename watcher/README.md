@@ -11,4 +11,4 @@ cargo build --release
 
 Config defaults to `$XDG_CONFIG_HOME/sigiltty/relay.json` (fallback `~/.config/sigiltty/relay.json`), read once — the app rewrites and restarts on any change. Single instance via flock on `watcher.lock` next to the config (PID inside). Exits silently on TTL expiry, config removal, lock loss, or exhausted failure retries; the app's per-connection health check is the only recovery path.
 
-Release targets (bootstrap contract, PROTOCOL §10): `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` — static binaries, built by CI.
+Release targets (bootstrap contract, PROTOCOL §10), built by CI and published to GitHub Releases on `v*` tags: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (static), `x86_64-apple-darwin`, `aarch64-apple-darwin` (native slices).

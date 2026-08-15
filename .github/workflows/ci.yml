@@ -1,14 +1,17 @@
 # CI for sigiltty-relay: relay tests (Node 24 + pnpm), watcher tests, and
-# cross-compiled static musl watcher binaries with a SHA256SUMS manifest
-# (the bootstrap contract, docs/PROTOCOL.md §10). CDN/R2 publishing and
-# Workers deploy are a later step — they need Cloudflare secrets; until
-# then the binaries ship as workflow artifacts.
+# watcher binaries for four targets — static musl for Linux (via cross),
+# native slices for macOS — with a SHA256SUMS manifest (the bootstrap
+# contract, docs/PROTOCOL.md §10). A v* tag additionally publishes the
+# binaries + manifest as a GitHub release, which is the distribution
+# channel the bootstrap curls from. Workers deploy is a later step — it
+# needs Cloudflare secrets.
 
 name: CI
 
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -48,24 +51,38 @@ jobs:
   watcher-build:
     name: watcher (${{ matrix.target }})
     needs: [watcher-test]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+        include:
+          # Linux: static musl via cross (docker). macOS: native cargo on
+          # the arm64 runner — cross is linux-only, and rustup handles the
+          # x86_64 slice as an ordinary added target.
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, cross: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, cross: true }
+          - { target: x86_64-apple-darwin, os: macos-latest, cross: false }
+          - { target: aarch64-apple-darwin, os: macos-latest, cross: false }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@v2
+        if: ${{ matrix.cross }}
         with:
           tool: cross
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: watcher
           key: ${{ matrix.target }}
-      - run: cross build --release --target ${{ matrix.target }}
+      - name: Build
         working-directory: watcher
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
       - name: Stage binary under its release name
         run: |
           mkdir -p dist
@@ -97,3 +114,24 @@ jobs:
           name: watcher-release
           path: dist/*
           if-no-files-found: error
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [relay, checksums]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: watcher-release
+          path: dist
+      - name: Create release with binaries + manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "sigiltty-watcher binaries (linux musl static ×2, macOS native ×2) + SHA256SUMS — the bootstrap contract's distribution artifacts (docs/PROTOCOL.md §10)."

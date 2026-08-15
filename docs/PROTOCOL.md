@@ -151,5 +151,5 @@ This exact string is also the app's **local** notification identifier for the sa
 
 - Binary: `$XDG_DATA_HOME/sigiltty/sigiltty-watcher` (fallback `~/.local/share/sigiltty/`), version marker alongside as `sigiltty-watcher.version`.
 - The app sends a single `sh -c`-wrapped bootstrap over SSH: compare version marker → on mismatch `curl` the target-specific binary from the release CDN, verify **sha256** against the app-known manifest hash, atomically move into place → start under `setsid`, detached.
-- CDN layout: `<base>/watcher/<version>/sigiltty-watcher-<target>` + `<base>/watcher/<version>/SHA256SUMS` where `<target>` ∈ `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`. (`<base>` TBD — same Cloudflare account as the relay, R2 or Workers-served.)
+- Distribution: GitHub Releases — `https://github.com/SigilTTY/sigiltty-relay/releases/download/<version>/sigiltty-watcher-<target>` plus `…/<version>/SHA256SUMS`, where `<target>` ∈ `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (static), `x86_64-apple-darwin`, `aarch64-apple-darwin` (native slices). The bootstrap resolves `<target>` from `uname -sm`. (A Cloudflare-fronted mirror can be added later without changing the layout.)
 - Any bootstrap failure rolls the opt-in switch back in the app and leaves no half-deployed state (partial downloads go to a temp path, never the final name).
