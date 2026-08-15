@@ -1,0 +1,99 @@
+# CI for sigiltty-relay: relay tests (Node 24 + pnpm), watcher tests, and
+# cross-compiled static musl watcher binaries with a SHA256SUMS manifest
+# (the bootstrap contract, docs/PROTOCOL.md §10). CDN/R2 publishing and
+# Workers deploy are a later step — they need Cloudflare secrets; until
+# then the binaries ship as workflow artifacts.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  relay:
+    name: relay (test + typecheck)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: relay/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm typecheck
+
+  watcher-test:
+    name: watcher (test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: watcher
+      - run: cargo test
+        working-directory: watcher
+
+  watcher-build:
+    name: watcher (${{ matrix.target }})
+    needs: [watcher-test]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: watcher
+          key: ${{ matrix.target }}
+      - run: cross build --release --target ${{ matrix.target }}
+        working-directory: watcher
+      - name: Stage binary under its release name
+        run: |
+          mkdir -p dist
+          cp "watcher/target/${{ matrix.target }}/release/sigiltty-watcher" \
+             "dist/sigiltty-watcher-${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sigiltty-watcher-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  checksums:
+    name: SHA256SUMS
+    needs: [watcher-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sigiltty-watcher-*
+          path: dist
+          merge-multiple: true
+      - name: Build manifest
+        run: |
+          cd dist
+          sha256sum sigiltty-watcher-* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: watcher-release
+          path: dist/*
+          if-no-files-found: error
