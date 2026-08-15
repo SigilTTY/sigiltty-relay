@@ -95,11 +95,11 @@ Plaintext (JSON, UTF-8) inside the HPKE envelope:
   "herdrSession": "..." | null,
   "agentLabel": "...",         // watcher-computed: agent.name > agent kind > "Agent"
   "paneLabel": "..." | null,   // from the config target's label
-  "status": "blocked" | "done",
+  "status": "blocked" | "done",  // the REPORTED status (§9), not always herdr's own
   "ts": <unix seconds> }
 ```
 
-NSE rendering mirrors the app's online copy exactly (`HerdrNotifier`): title `"{agentLabel} needs attention"` (blocked) / `"{agentLabel} finished"` (done), subtitle `serverName`, body `paneLabel` if present. The decrypted `serverID`/`paneID` go into `userInfo` for tap routing (focus live session, else locate the Agent Record in the Agents surface).
+The enum is two values and stays two values: a finish reaches the phone as `done` whether herdr called it `done` or `idle` (§9). NSE rendering mirrors the app's online copy exactly (`HerdrNotifier`): title `"{agentLabel} needs attention"` (blocked) / `"{agentLabel} finished"` (done), subtitle `serverName`, body `paneLabel` if present. The decrypted `serverID`/`paneID` go into `userInfo` for tap routing (focus live session, else locate the Agent Record in the Agents surface).
 
 ## 6. Server config file (written by the App over SSH)
 
@@ -142,7 +142,8 @@ This exact string is also the app's **local** notification identifier for the sa
 ## 9. Watcher behavior contract
 
 - One concurrent `herdr agent wait` loop per target — level-triggered, departure `--until` set, `--timeout 300000` heartbeat; identical CLI semantics to the app's online Agent Watch (herdr ≥ 0.8.0, absolute path from config).
-- **Hysteresis**: after observing a transition, the state must hold for the full window (§7) before it is compared against the last *reported* state; bounces inside the window vanish. Only stable `→blocked` / `→done` are reported. herdr's detector is known to flap — this window is the fix's home; the app does no further filtering.
+- **Hysteresis**: after observing a transition, the state must hold for the full window (§7) before it counts; bounces inside the window vanish. herdr's detector is known to flap — this window is the fix's home; the app does no further filtering.
+- **What reports** is a rule over the stable TRANSITION, not over the status alone: `→blocked` and `→done` from any prior state, plus `working → idle`. That last edge is a finish herdr had already counted as *seen* — its `done` means finished **and** not yet looked at, so a herdr TUI left open on the server turns every finish into plain `idle` — and it travels as `status: "done"` (§5's enum has no third value, and "finished" is the right NSE copy for it). The other two `idle` edges are silent: `done → idle` is the user looking at the pane, and `blocked → idle` is a question answered at the server with no work after it.
 - Seed semantics mirror the online watch: the first observation per target after startup never reports (the user just had the app open); a target's agent *appearing* later (missing → status) is a real event; missing is silent.
 - **Single instance** per server: lock file `$XDG_CONFIG_HOME/sigiltty/watcher.lock` (flock + PID; the app uses the PID for stop/restart).
 - Exit conditions: `expiresAt` in the past (checked per re-arm), config file missing/unreadable, persistent herdr failures after bounded backoff. Exiting is always silent — the app's health check (per connection) is the recovery path; the watcher never notifies about itself.

@@ -4,19 +4,21 @@
 //! (the app does no client-side filtering; four device-verified failures
 //! stand behind that) — and the awareness model deciding what reports.
 //!
-//! What reports: a STABLE transition INTO blocked or done, where "stable"
-//! means it survived the hysteresis window. The window is the entire
-//! flap defense — so no further dedup sits on top of it, because the most
-//! common real pattern is blocked → (answered) → working → blocked again,
-//! and a "same status as last time" filter swallows exactly that. Two
-//! silences remain: the run's very first observation (the seed — at deploy
-//! time the screen was in front of the user), and a pane with no agent,
-//! whose later appearance in a notifiable state does report.
+//! What reports: a STABLE transition the rule in `herdr::report_status`
+//! admits — into blocked or done from anywhere, plus the working → idle
+//! finish herdr believes was already seen — where "stable" means it survived
+//! the hysteresis window. The window is the entire flap defense — so no
+//! further dedup sits on top of it, because the most common real pattern is
+//! blocked → (answered) → working → blocked again, and a "same status as last
+//! time" filter swallows exactly that. Two silences remain: the run's very
+//! first observation (the seed — at deploy time the screen was in front of
+//! the user), and a pane with no agent, whose later appearance in a
+//! reportable state does report.
 //!
 //! The remote exec is injected, so the whole loop is scripted-unit-tested;
 //! only the process-spawning Remote at the bottom needs a live herdr.
 
-use crate::herdr::{departure_set, AgentInfo, AgentStatus, WaitOutcome};
+use crate::herdr::{departure_set, report_status, AgentInfo, AgentStatus, WaitOutcome};
 use std::time::Duration;
 
 pub trait Remote {
@@ -52,7 +54,9 @@ impl Default for Timing {
 }
 
 pub struct WatchHooks<'a> {
-    /// A stable, notifiable, not-yet-known-to-the-user transition.
+    /// A stable transition `herdr::report_status` admits. The AgentInfo
+    /// carries the status to put ON THE WIRE, which is not always the one
+    /// herdr called it (a seen finish travels as `done`).
     pub report: &'a mut dyn FnMut(&AgentInfo),
     pub should_continue: &'a dyn Fn() -> bool,
     pub sleep: &'a dyn Fn(Duration),
@@ -60,10 +64,9 @@ pub struct WatchHooks<'a> {
 }
 
 pub fn run(remote: &dyn Remote, timing: &Timing, hooks: &mut WatchHooks) {
-    // Last STABLE state; None = no agent on the pane (or not yet observed).
-    // The last STABLE state; None = no agent on the pane. Transitions are
-    // measured against this, never against what was last reported (see the
-    // module header).
+    // The last STABLE state; None = no agent on the pane (or not yet
+    // observed). Transitions are measured against this, never against what
+    // was last reported (see the module header).
     let mut current: Option<AgentStatus> = None;
     let mut seeded = false;
     let mut missing_backoff = timing.missing_start;
@@ -119,11 +122,21 @@ pub fn run(remote: &dyn Remote, timing: &Timing, hooks: &mut WatchHooks) {
                             continue;
                         }
                         let from = previous.map(|s| s.as_str()).unwrap_or("none");
-                        if status.notifiable() {
-                            (hooks.log)(&format!("{from} -> {}: reporting", status.as_str()));
-                            (hooks.report)(&agent);
-                        } else {
-                            (hooks.log)(&format!("{from} -> {}", status.as_str()));
+                        match report_status(previous, status) {
+                            Some(reported) => {
+                                // Says "as done" only when the wire status
+                                // differs from what herdr called it — the
+                                // working → idle finish, whose report would
+                                // otherwise look like a logging bug.
+                                let as_ = if reported == status {
+                                    String::new()
+                                } else {
+                                    format!(" as {}", reported.as_str())
+                                };
+                                (hooks.log)(&format!("{from} -> {}: reporting{as_}", status.as_str()));
+                                (hooks.report)(&AgentInfo { status: reported, ..agent });
+                            }
+                            None => (hooks.log)(&format!("{from} -> {}", status.as_str())),
                         }
                     }
                     Settled::Missing => {
@@ -176,7 +189,7 @@ fn settle(
 }
 
 /// Missing itself never reports, but it does count as an observation: the
-/// pane's next agent is a new incarnation, so its appearance in a notifiable
+/// pane's next agent is a new incarnation, so its appearance in a reportable
 /// state IS an event (a hand-started agent blocking on its startup prompt).
 fn apply_missing(current: &mut Option<AgentStatus>, seeded: &mut bool) {
     *seeded = true;
@@ -304,7 +317,7 @@ mod tests {
     fn reblock_after_a_working_episode_reports() {
         let (reported, _) = run_script(vec![
             agent(Blocked), WaitOutcome::TimedOut,  // seed: blocked, silent
-            agent(Working), WaitOutcome::TimedOut,  // answered; not notifiable
+            agent(Working), WaitOutcome::TimedOut,  // answered; nothing to report
             agent(Blocked), WaitOutcome::TimedOut,  // asks again → report
         ]);
         assert_eq!(reported, vec![Blocked]);
@@ -334,6 +347,38 @@ mod tests {
         // Alternating stable states each differ from the last reported one:
         // the relay's per-pane 60 s clock is the second (final) layer.
         assert_eq!(reported, vec![Blocked, Done, Blocked]);
+    }
+
+    /// A finish herdr classified as already seen (`working → idle`, because a
+    /// TUI was open on the server) still reaches the phone — as `done`, since
+    /// that is what the wire and the NSE understand.
+    #[test]
+    fn a_seen_finish_still_reports_and_travels_as_done() {
+        let (reported, _) = run_script(vec![
+            agent(Working), WaitOutcome::TimedOut,  // seed: working
+            agent(Idle), WaitOutcome::TimedOut,     // finished, counted seen
+        ]);
+        assert_eq!(reported, vec![Done]);
+    }
+
+    /// The other two idle edges, and the reason the rule reads transitions
+    /// rather than statuses: the user opening the pane must never push, and
+    /// an answered question with no work after it is not a finish.
+    #[test]
+    fn the_other_idle_edges_stay_silent() {
+        let (after_done, _) = run_script(vec![
+            agent(Working), WaitOutcome::TimedOut,  // seed
+            agent(Done), WaitOutcome::TimedOut,     // finished, unseen → reports
+            agent(Idle), WaitOutcome::TimedOut,     // the user looked at it
+        ]);
+        assert_eq!(after_done, vec![Done]);
+
+        let (after_blocked, _) = run_script(vec![
+            agent(Working), WaitOutcome::TimedOut,  // seed
+            agent(Blocked), WaitOutcome::TimedOut,  // asks → reports
+            agent(Idle), WaitOutcome::TimedOut,     // answered at the server
+        ]);
+        assert_eq!(after_blocked, vec![Blocked]);
     }
 
     #[test]

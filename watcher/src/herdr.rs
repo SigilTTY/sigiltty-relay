@@ -39,9 +39,33 @@ impl AgentStatus {
         }
     }
 
-    /// Only →blocked and →done ever notify (PROTOCOL §9, app decision #4).
-    pub fn notifiable(&self) -> bool {
-        matches!(self, AgentStatus::Blocked | AgentStatus::Done)
+}
+
+/// The reporting rule (PROTOCOL §9): given a stable transition, the status to
+/// put in the payload, or None for silence. A TRANSITION rule, not a
+/// per-status one — which of the two `idle` edges we are on decides
+/// everything, and the current status alone cannot say.
+///
+/// herdr's `done` means "finished AND the user has not looked yet"; a finish
+/// it believes was already seen arrives as plain `idle` instead (herdr
+/// CHANGELOG 0.4.6, 0.5.3). That belief is a guess about a screen we cannot
+/// see — a herdr TUI left open on the server marks every finish seen — so
+/// `working → idle` is reported too, as `done`. It IS a finish; §5 pins the
+/// payload enum to blocked|done, and the NSE's "finished" copy is the right
+/// wording for it.
+///
+/// The other two `idle` edges stay silent, and they are the reason this is
+/// not simply "idle notifies":
+///   - `done → idle` is herdr marking a pending finish seen — the user
+///     looking at the pane, which must never itself push.
+///   - `blocked → idle` is a question answered at the server without work
+///     following it.
+pub fn report_status(previous: Option<AgentStatus>, current: AgentStatus) -> Option<AgentStatus> {
+    match (previous, current) {
+        (_, AgentStatus::Blocked) => Some(AgentStatus::Blocked),
+        (_, AgentStatus::Done) => Some(AgentStatus::Done),
+        (Some(AgentStatus::Working), AgentStatus::Idle) => Some(AgentStatus::Done),
+        _ => None,
     }
 }
 
@@ -168,6 +192,27 @@ pub fn parse_wait_output(combined: &str) -> WaitOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_two_idle_edges_are_told_apart() {
+        use AgentStatus::*;
+        // A finish herdr counted as seen is still a finish, and travels as
+        // `done` — the payload enum has no third value (PROTOCOL §5).
+        assert_eq!(report_status(Some(Working), Idle), Some(Done));
+        // The user looking at a pending finish is not an event.
+        assert_eq!(report_status(Some(Done), Idle), None);
+        // Nor is a question answered at the server with no work after it.
+        assert_eq!(report_status(Some(Blocked), Idle), None);
+        // Nor a resting pane's agent simply appearing.
+        assert_eq!(report_status(None, Idle), None);
+        // Unchanged: both reportable states report from anywhere.
+        assert_eq!(report_status(Some(Working), Blocked), Some(Blocked));
+        assert_eq!(report_status(Some(Working), Done), Some(Done));
+        assert_eq!(report_status(None, Blocked), Some(Blocked));
+        // Unknown is detection noise, and →working is not an event.
+        assert_eq!(report_status(Some(Working), Unknown), None);
+        assert_eq!(report_status(Some(Idle), Working), None);
+    }
 
     #[test]
     fn departure_excludes_current_and_probe_is_all_five() {

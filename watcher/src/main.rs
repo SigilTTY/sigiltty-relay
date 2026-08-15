@@ -1,7 +1,8 @@
 //! sigiltty-watcher — server-side herdr agent watcher for SigilTTY
 //! offline push (docs/PROTOCOL.md; design: SigilTTY ADR-0014). Reads the
 //! app-written config once, watches every target pane on its own thread,
-//! reports stable →blocked/→done transitions to the relay, and dies
+//! reports the stable transitions `herdr::report_status` admits to the
+//! relay (→blocked, →done, and the seen finish `working → idle`), and dies
 //! silently at TTL expiry / config removal / persistent failure — the
 //! app's per-connection health check is the only recovery path.
 
