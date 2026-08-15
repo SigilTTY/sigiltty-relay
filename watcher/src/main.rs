@@ -10,6 +10,7 @@ mod herdr;
 mod lock;
 mod relay;
 mod seal;
+mod timefmt;
 mod watch;
 
 use herdr::{parse_wait_output, wait_args, AgentStatus, WaitOutcome};
@@ -22,8 +23,12 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// stderr, because stdout is reserved for `--version`. The timestamp is our
+/// own: the watcher is started by the app's bootstrap, not by an init system
+/// that would stamp lines for us, so a bare message is undatable once it
+/// lands in a redirect.
 fn log(message: &str) {
-    eprintln!("[{}] {message}", now_unix());
+    eprintln!("[{}] {message}", timefmt::iso8601_local(now_unix()));
 }
 
 /// Spawns the herdr CLI directly (no shell — we ARE on the server, so the
@@ -97,7 +102,7 @@ fn main() {
 
     log(&format!(
         "watching {} target(s) for {} device(s), expires at {}",
-        cfg.targets.len(), cfg.devices.len(), cfg.expires_at,
+        cfg.targets.len(), cfg.devices.len(), timefmt::iso8601_local(cfg.expires_at),
     ));
 
     let cfg = Arc::new(cfg);
