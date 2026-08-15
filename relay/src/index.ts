@@ -8,11 +8,14 @@ import { D1Store } from './store/d1.ts'
 
 export interface Env {
   DB: D1Database
+  // Secrets (`wrangler secret put`), never wrangler.toml [vars] — the
+  // runtime surfaces both on `env`, so the split is a deployment concern
+  // only. APNS_PRIVATE_KEY is the whole .p8 file contents.
   APNS_TEAM_ID: string
   APNS_KEY_ID: string
-  APNS_TOPIC: string
-  // Secret (`wrangler secret put APNS_PRIVATE_KEY`): the .p8 file contents.
   APNS_PRIVATE_KEY: string
+  // Plain var: the public bundle ID.
+  APNS_TOPIC: string
 }
 
 let app: ReturnType<typeof createRelay> | undefined

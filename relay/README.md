@@ -15,7 +15,16 @@ Both stores apply the same `schema.sql`.
 pnpm install
 pnpm test        # vitest — validation, APNs pieces, endpoint flow over :memory: sqlite
 pnpm typecheck   # both worlds: workers-types and @types/node
-pnpm dev         # wrangler dev
+pnpm dev         # wrangler dev — needs .dev.vars (below)
+```
+
+Deployed secrets are not readable locally, so `wrangler dev` takes the same
+names from an untracked `.dev.vars`:
+
+```
+APNS_TEAM_ID="…"
+APNS_KEY_ID="…"
+APNS_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n…"
 ```
 
 ## Prerequisite: an APNs auth key
@@ -25,15 +34,43 @@ Apple Developer portal → Certificates, Identifiers & Profiles → **Keys** →
 ## Deploy: Cloudflare Workers
 
 ```bash
+`wrangler.toml` is a template: it carries no account-specific value, so
+these steps are what turn it into *your* deployment.
+
+```bash
 pnpm wrangler login                     # interactive, once per machine
 pnpm wrangler d1 create sigiltty-relay  # paste the database_id into wrangler.toml
 pnpm wrangler d1 execute sigiltty-relay --file=schema.sql --remote
-# fill APNS_TEAM_ID / APNS_KEY_ID in wrangler.toml (APNS_TOPIC is already the bundle ID)
-pnpm wrangler secret put APNS_PRIVATE_KEY   # paste the whole .p8 file contents
+
+# Credentials are secrets, never [vars] — see the note in wrangler.toml.
+pnpm wrangler secret put APNS_TEAM_ID
+pnpm wrangler secret put APNS_KEY_ID
+pnpm wrangler secret put APNS_PRIVATE_KEY < /path/to/AuthKey_XXXXXXXXXX.p8
+pnpm wrangler secret list                   # three names, no values
 pnpm run deploy
 ```
 
 Use `pnpm run deploy`, not `pnpm deploy` — pnpm has a built-in `deploy` command that swallows the script. `pnpm run deploy --dry-run` bundles without uploading (a useful preflight; needs no login).
+
+Secrets take effect immediately and survive redeploys; only `wrangler secret delete` removes them. On the first `secret put` the Worker does not exist yet and wrangler offers to create it — answer yes.
+
+### Keeping your deployment out of git
+
+`database_id`, and `routes` if you serve on your own hostname, must be real
+in the config wrangler reads — but committing them publishes your
+deployment and forces every fork to undo it. Keep them in an untracked copy
+instead (`wrangler.local.toml` is already ignored):
+
+```bash
+cp wrangler.toml wrangler.local.toml     # fill in the real values here
+pnpm wrangler deploy --config wrangler.local.toml
+```
+
+The tracked `wrangler.toml` then stays at its placeholders. The cost is that
+the two files drift, so re-copy after any change to bindings, triggers or
+`compatibility_date`. Committing the real values instead is a defensible
+choice for a repo nobody forks — neither a D1 UUID nor a hostname is a
+credential — but it is not the default here.
 
 ## Verifying a deployment
 

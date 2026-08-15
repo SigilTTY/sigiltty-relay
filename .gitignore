@@ -11,3 +11,7 @@ target/
 .dev.vars*
 *.sqlite3
 *.sqlite3-*
+
+# Your filled-in wrangler config (database_id, routes). The tracked
+# wrangler.toml stays a placeholder template — see relay/README.md.
+wrangler.local.toml

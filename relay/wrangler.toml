@@ -1,6 +1,11 @@
 # SigilTTY relay — Cloudflare Workers + D1 (docs/PROTOCOL.md is normative).
-# Deploy runbook: relay/README.md. APNS_PRIVATE_KEY is a secret
-# (`wrangler secret put APNS_PRIVATE_KEY`), never a var.
+# Deploy runbook: relay/README.md.
+#
+# This file is a TEMPLATE, not a record of any live deployment. Every
+# account-specific value is a placeholder or a secret, so a fork can deploy
+# its own relay without editing history and no operator's identifiers are
+# published. Fill the placeholders locally and keep that edit uncommitted
+# (see "Keeping your deployment out of git" in the README).
 
 name = "sigiltty-relay"
 main = "src/index.ts"
@@ -9,12 +14,29 @@ compatibility_date = "2026-08-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "sigiltty-relay"
+# Required. `wrangler d1 create sigiltty-relay` prints it. Pin it rather
+# than omitting it: wrangler treats database_id as optional and would
+# provision a database at deploy time, and a deploy that silently bound a
+# fresh, empty D1 would drop every registered device without erroring.
 database_id = "TBD-run-wrangler-d1-create"
 
 [vars]
-APNS_TEAM_ID = "TBD"
-APNS_KEY_ID = "TBD"
+# The iOS bundle ID — public, an app-side contract (PROTOCOL §4), and the
+# same for every deployment, so it is the only value committed here.
 APNS_TOPIC = "com.sigiltty.shell"
+
+# APNS_TEAM_ID, APNS_KEY_ID and APNS_PRIVATE_KEY are deliberately absent:
+# they arrive through `wrangler secret put`. Secrets and vars both surface
+# on `env`, so src/index.ts reads them identically — but they must never be
+# added to [vars], because wrangler does not define which value wins when a
+# secret and a var share a name.
+
+# Optional: serve on your own hostname instead of *.workers.dev. Adding
+# `routes` also makes wrangler disable workers.dev and Preview URLs by
+# default, which is what you want for a relay handling device tokens.
+# routes = [
+#   { pattern = "relay.example.com", custom_domain = true },
+# ]
 
 # Daily purge of expired registrations and stale rate-limit rows.
 [triggers]
