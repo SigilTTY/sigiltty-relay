@@ -18,13 +18,52 @@ pnpm typecheck   # both worlds: workers-types and @types/node
 pnpm dev         # wrangler dev
 ```
 
+## Prerequisite: an APNs auth key
+
+Apple Developer portal → Certificates, Identifiers & Profiles → **Keys** → new key with **Apple Push Notifications service (APNs)** enabled. The `.p8` downloads **once** — keep it; note the **Key ID** shown next to it and the **Team ID** (portal header, same as the Xcode project's `DEVELOPMENT_TEAM`). One token-auth key serves both the sandbox and production APNs hosts.
+
 ## Deploy: Cloudflare Workers
 
-1. `wrangler d1 create sigiltty-relay` → paste the returned `database_id` into `wrangler.toml`.
-2. `wrangler d1 execute sigiltty-relay --file=schema.sql --remote`
-3. Fill `APNS_TEAM_ID` / `APNS_KEY_ID` in `wrangler.toml` (`APNS_TOPIC` is already `com.sigiltty.shell`).
-4. `wrangler secret put APNS_PRIVATE_KEY` → paste the full contents of the `.p8` key file.
-5. `pnpm deploy`
+```bash
+pnpm wrangler login                     # interactive, once per machine
+pnpm wrangler d1 create sigiltty-relay  # paste the database_id into wrangler.toml
+pnpm wrangler d1 execute sigiltty-relay --file=schema.sql --remote
+# fill APNS_TEAM_ID / APNS_KEY_ID in wrangler.toml (APNS_TOPIC is already the bundle ID)
+pnpm wrangler secret put APNS_PRIVATE_KEY   # paste the whole .p8 file contents
+pnpm run deploy
+```
+
+Use `pnpm run deploy`, not `pnpm deploy` — pnpm has a built-in `deploy` command that swallows the script. `pnpm run deploy --dry-run` bundles without uploading (a useful preflight; needs no login).
+
+## Verifying a deployment
+
+Endpoints first (`$RELAY` = the deployed URL; add `--noproxy '*'` when testing a local Node entry through a proxying VPN client):
+
+```bash
+TOKEN=$(printf 'a%.0s' {1..64})   # syntactically valid, deliberately fake
+REG=$(curl -s -X POST $RELAY/v1/register -H 'content-type: application/json' \
+  -d '{"platform":"ios","tokenKind":"alert","apnsEnvironment":"sandbox","apnsToken":"'"$TOKEN"'"}')
+echo "$REG"                        # → {"routingID":…,"secret":…}
+```
+
+Then the **APNs credential chain, without any device**: post one event for that fake token and read the pair of answers.
+
+```bash
+# … build an events POST with the routingID/secret from $REG, any collapseKey,
+#    ts = now, ciphertext = 64 'A's (never decrypted — APNs rejects first) …
+curl -s -X POST $RELAY/v1/events -H 'content-type: application/json' -d "$EVENTS"
+curl -s -o /dev/null -w '%{http_code}\n' -X POST $RELAY/v1/renew \
+  -H 'content-type: application/json' -d '{"routingID":…,"secret":…}'
+```
+
+| events result | renew after | Meaning |
+|---|---|---|
+| `unknownRouting` | `404` | ✅ APNs **accepted the JWT** and answered `BadDeviceToken` (expected — the token is fake), so the relay dropped the registration. Team ID, Key ID, `.p8` and topic are all correct. |
+| `sendFailed` | `204` | ❌ APNs refused the provider token or the topic (`InvalidProviderToken` / `TopicDisallowed`), or the request never got out. Check the vars and the secret. |
+
+Register fresh for each attempt: a successful check deletes the registration, so a second event on the same routing would return `unknownRouting` for the *other* reason. The relay logs no APNs reason strings — use `pnpm wrangler tail` while testing if you need the raw status.
+
+A real banner on a real device needs a device token, which arrives with the app-side registration (SigilTTY P2).
 
 ## Deploy: self-hosted (Node ≥ 24)
 
