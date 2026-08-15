@@ -14,12 +14,13 @@ import { serve } from '@hono/node-server'
 import { Agent, fetch as undiciFetch } from 'undici'
 import { createApnsSender, type FetchLike } from './apns.ts'
 import { createRelay } from './app.ts'
+import { error, info } from './log.ts'
 import { SqliteStore } from './store/sqlite.ts'
 
 function requireEnv(name: string): string {
   const value = process.env[name]
   if (!value) {
-    console.error(`sigiltty-relay: missing required environment variable ${name}`)
+    error(`sigiltty-relay: missing required environment variable ${name}`)
     process.exit(1)
   }
   return value
@@ -51,4 +52,4 @@ setInterval(() => void store.purge(nowSeconds()), 24 * 3600 * 1000).unref()
 
 const port = Number(process.env.PORT ?? 8788)
 serve({ fetch: app.fetch, port })
-console.log(`sigiltty-relay listening on :${port}`)
+info(`sigiltty-relay listening on :${port}`)

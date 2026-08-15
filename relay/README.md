@@ -33,7 +33,6 @@ Apple Developer portal → Certificates, Identifiers & Profiles → **Keys** →
 
 ## Deploy: Cloudflare Workers
 
-```bash
 `wrangler.toml` is a template: it carries no account-specific value, so
 these steps are what turn it into *your* deployment.
 
@@ -101,6 +100,41 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST $RELAY/v1/renew \
 Register fresh for each attempt: a successful check deletes the registration, so a second event on the same routing would return `unknownRouting` for the *other* reason. The relay logs no APNs reason strings — use `pnpm wrangler tail` while testing if you need the raw status.
 
 A real banner on a real device needs a device token, which arrives with the app-side registration (SigilTTY P2).
+
+## Reading logs and stored times
+
+Every relay log line opens with an ISO-8601 UTC instant and a level:
+
+```
+2026-08-15T11:06:07.784Z INFO  sigiltty-relay listening on :8788
+2026-08-15T11:06:07.785Z WARN  apns rejected: 403 InvalidProviderToken
+```
+
+UTC rather than local time: a Worker isolate has no meaningful timezone, and the line usually has to be lined up against an APNs response or a watcher log from elsewhere. `pnpm wrangler tail` streams them from the deployed Worker; the self-hosted entry writes them to stdout. Lines carry status codes, reasons and counts — never a device token, collapse key or envelope.
+
+Times in the database are stored as unix seconds, since every read of one is a comparison, a range delete or a bucket key. Each is mirrored by a generated `*_utc` column rendering the same instant in the same format as the logs:
+
+```bash
+pnpm wrangler d1 execute sigiltty-relay --remote --command \
+  "SELECT routing_id, apns_environment, created_at_utc, last_seen_at_utc FROM registrations"
+```
+
+| Table | Stored integer | Readable mirror |
+|---|---|---|
+| `registrations` | `created_at`, `last_seen_at` | `created_at_utc`, `last_seen_at_utc` |
+| `send_log` | `sent_at` | `sent_at_utc` |
+| `hourly_counts` | `hour_bucket` (hours since epoch) | `hour_start_utc` |
+
+The mirrors are `VIRTUAL` generated columns — no stored bytes, computed on read, so they cannot drift from the integer beside them. Select columns explicitly rather than `SELECT *`: `registrations` holds live APNs device tokens, and command output tends to end up pasted somewhere.
+
+**An existing database needs one migration.** `schema.sql` carries these columns for a fresh database, but `CREATE TABLE IF NOT EXISTS` never alters a table that already exists — re-applying it to a live relay changes nothing. Run once per database:
+
+```bash
+pnpm wrangler d1 execute sigiltty-relay --remote \
+  --file=upgrades/0001_readable_timestamps.sql
+```
+
+Additive and reversible: no row is rewritten and `ALTER TABLE … DROP COLUMN` takes the columns back off. Re-running it fails on `duplicate column name`, which means it was already applied. Self-hosted equivalent: `sqlite3 /var/lib/sigiltty-relay/relay.sqlite3 < upgrades/0001_readable_timestamps.sql`.
 
 ## Deploy: self-hosted (Node ≥ 24)
 

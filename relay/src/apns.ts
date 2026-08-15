@@ -5,6 +5,7 @@
 // Workers the platform fetch speaks HTTP/2; on Node the entry must supply
 // an h2-capable fetch (undici allowH2) — APNs rejects HTTP/1.1.
 
+import { warn } from './log.ts'
 import type { ApnsEnvironment } from './types.ts'
 import { base64urlFromBytes, base64urlFromString } from './util.ts'
 
@@ -118,7 +119,7 @@ export function createApnsSender(credentials: ApnsCredentials, fetchImpl?: Fetch
       } catch (error) {
         // Transport-level failure (TLS, DNS, no HTTP/2). Worth a line: an
         // opaque sendFailed with no reason is very expensive to debug.
-        console.warn(`apns request failed: ${error instanceof Error ? error.message : String(error)}`)
+        warn(`apns request failed: ${error instanceof Error ? error.message : String(error)}`)
         return 'sendFailed'
       }
       if (response.ok) return 'sent'
@@ -130,7 +131,7 @@ export function createApnsSender(credentials: ApnsCredentials, fetchImpl?: Fetch
       // Config-level rejections land here (InvalidProviderToken from a wrong
       // team/key, TopicDisallowed, ExpiredProviderToken from clock skew).
       // Status + reason only — never the token, never the envelope.
-      console.warn(`apns rejected: ${response.status} ${reason ?? '(no reason)'}`)
+      warn(`apns rejected: ${response.status} ${reason ?? '(no reason)'}`)
       return 'sendFailed'
     },
   }
