@@ -20,8 +20,8 @@ sigiltty-watcher uninstall [--config <path>] [--keep-binary]
 `status` prints one machine-readable line with no user content in it — no server name, no pane IDs, no device credentials:
 
 ```
-config=present version=0.1.3 running=yes pid=8421 expires=4102444800 fingerprint=9f2c0d4ab1 targets=1
-config=absent version=0.1.3 running=no
+config=present version=0.1.4 running=yes pid=8421 expires=4102444800 fingerprint=9f2c0d4ab1 targets=1
+config=absent version=0.1.4 running=no
 ```
 
 `uninstall` stops the watcher, then removes the config, the lock, the log, the legacy version marker and (unless `--keep-binary`) the installed binary, plus any directory that leaves empty. Removing nothing is still exit 0 — the app retries removal on its next connection, so this has to be idempotent. Exit 1 means something survived; exit 2 is a usage error.
