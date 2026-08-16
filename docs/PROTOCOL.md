@@ -111,12 +111,15 @@ The enum is two values and stays two values: a finish reaches the phone as `done
   "serverID": "<uuid>", "serverName": "...",
   "herdrBinary": "/abs/path/to/herdr",
   "expiresAt": <unix seconds>,           // watcher TTL — app renews on every connection
+  "targetsFingerprint": "<opaque>",      // app-owned; the watcher only echoes it (§10)
   "devices": [ { "routingID": "...", "secret": "...",
                  "publicKey": "<base64 X25519>", "platform": "ios" } ],
   "targets": [ { "paneID": "w1:p4", "herdrSession": "..." | null, "label": "..." } ] }
 ```
 
 The file is the **source of truth for opt-in**: it exists iff offline push is enabled for this server. Disable = stop watcher + delete file (and the app's local cache flag). The watcher reads it **once at startup**; any change (targets, devices, renewal) is applied by the app rewriting the file and restarting the watcher — the watcher never self-reloads.
+
+`targetsFingerprint` is the app's own digest of the target set it believes it deployed, in whatever form the app likes — the watcher never parses it, never acts on it, and only prints it back in `status` (§10) so the app can ask "is the config on that box still the one I would write?" without shipping the target list home. It is optional: a config written before the field existed still loads.
 
 ## 7. Limits
 
@@ -145,12 +148,34 @@ This exact string is also the app's **local** notification identifier for the sa
 - **Hysteresis**: after observing a transition, the state must hold for the full window (§7) before it counts; bounces inside the window vanish. herdr's detector is known to flap — this window is the fix's home; the app does no further filtering.
 - **What reports** is a rule over the stable TRANSITION, not over the status alone: `→blocked` and `→done` from any prior state, plus `working → idle`. That last edge is a finish herdr had already counted as *seen* — its `done` means finished **and** not yet looked at, so a herdr TUI left open on the server turns every finish into plain `idle` — and it travels as `status: "done"` (§5's enum has no third value, and "finished" is the right NSE copy for it). The other two `idle` edges are silent: `done → idle` is the user looking at the pane, and `blocked → idle` is a question answered at the server with no work after it.
 - Seed semantics mirror the online watch: the first observation per target after startup never reports (the user just had the app open); a target's agent *appearing* later (missing → status) is a real event; missing is silent.
-- **Single instance** per server: lock file `$XDG_CONFIG_HOME/sigiltty/watcher.lock` (flock + PID; the app uses the PID for stop/restart).
+- **Single instance** per server: lock file `$XDG_CONFIG_HOME/sigiltty/watcher.lock`, held under `flock` for the life of the process, PID written inside. The **lock**, not the PID, is what says a watcher is alive — a PID outlives the crash that orphaned it and the OS eventually hands that number to somebody else, so liveness is a non-blocking `flock` probe on a read-only fd: acquiring it means nobody holds it (the PID inside is stale), failing means the PID inside is the live holder's and is the only one safe to signal (§10).
+- **Log ceiling**: diagnostics go to stderr, which the bootstrap redirects at `$XDG_DATA_HOME/sigiltty/watcher.log` and truncates per run. The watcher additionally caps that file at **5 MB**, checked once a minute: over the cap it is rewritten as its own second half, on a line boundary, and the watcher's own write offset moves with it. So on-disk size swings between 2.5 MB and 5 MB and never depends on the app reconnecting to reset it — a run may last the full TTL, and a flapping herdr writes a line per settle window for as long as it flaps. The tail is what survives, because the lines worth having are the recent ones. Only a regular file whose device+inode match that path is touched: stderr on a terminal, a pipe, or a file somebody else redirected is left alone.
 - Exit conditions: `expiresAt` in the past (checked per re-arm), config file missing/unreadable, persistent herdr failures after bounded backoff. Exiting is always silent — the app's health check (per connection) is the recovery path; the watcher never notifies about itself.
 
 ## 10. Bootstrap contract
 
-- Binary: `$XDG_DATA_HOME/sigiltty/sigiltty-watcher` (fallback `~/.local/share/sigiltty/`), version marker alongside as `sigiltty-watcher.version`.
-- The app sends a single `sh -c`-wrapped bootstrap over SSH: compare version marker → on mismatch `curl` the target-specific binary from the release CDN, verify **sha256** against the app-known manifest hash, atomically move into place → start under `setsid`, detached.
+- Binary: `$XDG_DATA_HOME/sigiltty/sigiltty-watcher` (fallback `~/.local/share/sigiltty/`).
+- The app sends a single `sh -c`-wrapped bootstrap over SSH: compare the installed version → on mismatch `curl` the target-specific binary from the release CDN, verify **sha256** against the app-known manifest hash, atomically move into place → start under `setsid`, detached.
+- **The binary is the source of truth about itself.** The installed version is `sigiltty-watcher --version`, which prints the bare semver on stdout and nothing else; the app compares it against the release tag it pins with the leading `v` stripped (`v0.1.4` → `0.1.4`). A binary that fails to exec, or answers something unparseable, is *not installed* — reinstall. No side file records the version: a marker written at install time describes what was **downloaded**, so a truncated download, a wrong-arch copy or a hand-replaced binary all keep reporting the old answer. A watcher that predates this contract still answers `--version`, and any `sigiltty-watcher.version` left over from the marker era is inert and removed by `uninstall`.
+- **Commands** (usage error → exit 2 for all of them; `--config <path>` may precede or follow the command word and defaults to §6's path):
+
+  | Command | stdout | exit |
+  |---|---|---|
+  | `sigiltty-watcher [--config P]` | — (diagnostics on stderr) | runs the watch loop; bare invocation is unchanged from 0.1.0 |
+  | `--version` \| `-V` | `0.1.4` | 0 |
+  | `--help` \| `-h` | usage | 0 |
+  | `status [--config P]` | one `key=value` line | 0 |
+  | `uninstall [--config P] [--keep-binary]` | one line per thing removed | 0 clean, 1 something survived |
+
+- `status` is one line, machine-readable, and **carries no user content** — no server name, no pane IDs, no device credentials, nothing the zero-knowledge posture protects:
+
+  ```
+  config=present version=0.1.4 running=yes pid=8421 expires=4102444800 fingerprint=9f2c0d4ab1 targets=1
+  config=absent version=0.1.4 running=no
+  ```
+
+  `running` comes from the flock probe (§9), and `pid` is present only when a live holder was found. `expires`, `fingerprint` and `targets` come from the config and are omitted when it is absent or unparseable — `config=present` with nothing after `running` therefore means *reinstall the config*.
+- `uninstall` stops the running watcher (SIGTERM, confirmed by the lock releasing, SIGKILL as a last resort), then removes the config, the lock, the log, the legacy version marker, any `.new` temp file and — unless `--keep-binary` — the installed binary, plus any directory those leave empty. Deleting the running binary is legal on both targets (POSIX `unlink` on a running executable succeeds). Orphaned `herdr agent wait` children are left to the §9 reaper. **Removing nothing is still exit 0**: the app retries a failed removal on the next connection, so uninstall must be idempotent. `--keep-binary` is the opt-out path — the deployment goes away but re-enabling costs no download.
 - Distribution: GitHub Releases — `https://github.com/SigilTTY/sigiltty-relay/releases/download/<version>/sigiltty-watcher-<target>` plus `…/<version>/SHA256SUMS`, where `<target>` ∈ `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (static), `x86_64-apple-darwin`, `aarch64-apple-darwin` (native slices). The bootstrap resolves `<target>` from `uname -sm`. (A Cloudflare-fronted mirror can be added later without changing the layout.)
 - Any bootstrap failure rolls the opt-in switch back in the app and leaves no half-deployed state (partial downloads go to a temp path, never the final name).
+- **Compatibility.** Nothing here is a wire change, so it needs no `/v1/` or payload `v` bump and no coordinated release. Every watcher ever released answers `--version`, and `--config P` with no command word still means "run" — an app pinned to an older release keeps working against a newer binary, and the version check can move off the marker file whenever the app likes. `status` and `uninstall` need **≥ 0.1.4**; against anything older they exit 2, which the app must read as "too old" and fall back to its own inline removal (`rm -f` of the config and lock) rather than as a failure.

@@ -19,6 +19,13 @@ pub struct RelayConfig {
     pub herdr_binary: String,
     #[serde(rename = "expiresAt")]
     pub expires_at: u64,
+    /// The app's digest of what it believes this watcher watches (§6). Opaque
+    /// here — never parsed, never acted on, only echoed back by `status` so
+    /// the app can ask "is the deployed config still the one I would write?"
+    /// without shipping the whole target list back. Defaulted, because
+    /// configs written before the field existed must still load.
+    #[serde(rename = "targetsFingerprint", default)]
+    pub targets_fingerprint: String,
     pub devices: Vec<Device>,
     pub targets: Vec<Target>,
 }

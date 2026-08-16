@@ -6,15 +6,19 @@
 //! silently at TTL expiry / config removal / persistent failure — the
 //! app's per-connection health check is the only recovery path.
 
+mod admin;
+mod cli;
 mod config;
 mod herdr;
 mod lock;
+mod logcap;
 mod relay;
 mod seal;
 mod timefmt;
 mod watch;
 
 use herdr::{parse_wait_output, wait_args, AgentStatus, WaitOutcome};
+use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -24,10 +28,11 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// stderr, because stdout is reserved for `--version`. The timestamp is our
-/// own: the watcher is started by the app's bootstrap, not by an init system
-/// that would stamp lines for us, so a bare message is undatable once it
-/// lands in a redirect.
+/// stderr, because stdout belongs to the commands that answer questions
+/// (`--version`, `status`, `uninstall`) and their output is parsed. The
+/// timestamp is our own: the watcher is started by the app's bootstrap, not
+/// by an init system that would stamp lines for us, so a bare message is
+/// undatable once it lands in a redirect.
 fn log(message: &str) {
     eprintln!("[{}] {message}", timefmt::iso8601_local(now_unix()));
 }
@@ -55,29 +60,43 @@ impl watch::Remote for ProcessRemote {
     }
 }
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn main() {
-    let mut config_path = config::default_config_path();
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--version" => {
-                println!("{}", env!("CARGO_PKG_VERSION"));
-                return;
-            }
-            "--config" => {
-                let Some(path) = args.next() else {
-                    eprintln!("--config requires a path");
-                    std::process::exit(2);
-                };
-                config_path = path.into();
-            }
-            other => {
-                eprintln!("unknown argument: {other}");
-                std::process::exit(2);
+    let command = match cli::parse(std::env::args().skip(1), config::default_config_path()) {
+        Ok(command) => command,
+        Err(message) => {
+            eprintln!("{message}\ntry: sigiltty-watcher --help");
+            std::process::exit(2);
+        }
+    };
+    match command {
+        // The bare semver, unchanged since 0.1.0 and unchanged forever: this
+        // is what the bootstrap compares against the version it pins, and it
+        // replaced a marker file precisely because it cannot go stale.
+        cli::Command::Version => println!("{VERSION}"),
+        cli::Command::Help => println!("{}", cli::USAGE),
+        cli::Command::Status(config) => {
+            println!("{}", admin::status_line(&admin::Paths::resolve(&config), VERSION))
+        }
+        cli::Command::Uninstall { config, keep_binary } => {
+            // Report to stdout: this is an answer to whoever asked for the
+            // removal, not the running watcher's diagnostics.
+            let clean = admin::uninstall(
+                &admin::Paths::resolve(&config),
+                keep_binary,
+                &|d| std::thread::sleep(d),
+                &|m| println!("{m}"),
+            );
+            if !clean {
+                std::process::exit(1);
             }
         }
+        cli::Command::Run(config) => run(config),
     }
+}
 
+fn run(config_path: std::path::PathBuf) {
     // Exit conditions are all silent successes (PROTOCOL §9): no config =
     // opt-in revoked; expired = TTL did its job; lock lost = incumbent runs.
     let cfg = match config::load(&config_path) {
@@ -126,8 +145,17 @@ fn main() {
     // threads block in five-minute waits, so exiting the PROCESS is the
     // prompt path — orphaned herdr waits die of SIGPIPE at their next
     // write, at most one remote timeout away (the documented reaper).
+    let log_path = admin::Paths::resolve(&config_path).log;
     loop {
         std::thread::sleep(Duration::from_secs(60));
+        // The log is the only record of what this watcher decided, and a run
+        // may last the full TTL, so it gets a ceiling here rather than
+        // relying on the app reconnecting to truncate it (PROTOCOL §9).
+        if let Some(note) =
+            logcap::enforce(std::io::stderr().as_raw_fd(), &log_path, logcap::CAP_BYTES)
+        {
+            log(&note);
+        }
         let expired = cfg.expires_at <= now_unix();
         let revoked = !config_path.exists();
         let all_done = handles.iter().all(|h| h.is_finished());
