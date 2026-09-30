@@ -41,7 +41,8 @@ impl AgentStatus {
 
 }
 
-/// The reporting rule (PROTOCOL §9): given a stable transition, the status to
+/// The edge rule (PROTOCOL §9, daemons before 0.9.2 — `report_transition`
+/// picks): given a stable transition, the status to
 /// put in the payload, or None for silence. A TRANSITION rule, not a
 /// per-status one — which of the two `idle` edges we are on decides
 /// everything, and the current status alone cannot say.
@@ -69,6 +70,90 @@ pub fn report_status(previous: Option<AgentStatus>, current: AgentStatus) -> Opt
     }
 }
 
+/// First herdr whose agent JSON carries `completion_seq` (herdr #4457).
+pub const COMPLETION_SEQ_VERSION: [u64; 3] = [0, 9, 2];
+
+/// The rule once the daemon names its own finishes (herdr ≥ 0.9.2,
+/// PROTOCOL §9). herdr sets `completion_seq` on an idle only when a turn
+/// really ended — never for startup, a restored session or `/new`, the
+/// three `working → idle` edges `report_status` misreads as finishes. So an
+/// idle or done reports as `done` exactly when it carries a sequence the
+/// previous stable observation did not: `done → idle` (the user looking at
+/// the pane) keeps the same sequence and stays silent, and `blocked → idle`
+/// is a finish whenever herdr says so. `→blocked` is unchanged. Without the
+/// version gate (`completion_aware` false) an absent sequence means
+/// nothing, and the edge rule applies.
+pub fn report_transition(
+    previous: Option<&AgentInfo>,
+    current: &AgentInfo,
+    completion_aware: bool,
+) -> Option<AgentStatus> {
+    if !completion_aware {
+        return report_status(previous.map(|p| p.status), current.status);
+    }
+    match current.status {
+        AgentStatus::Blocked => Some(AgentStatus::Blocked),
+        AgentStatus::Idle | AgentStatus::Done => {
+            let seq = current.completion_seq?;
+            (previous.and_then(|p| p.completion_seq) != Some(seq)).then_some(AgentStatus::Done)
+        }
+        AgentStatus::Working | AgentStatus::Unknown => None,
+    }
+}
+
+/// `herdr [--session S] status --json` — the probe the version gate reads.
+pub fn status_args(session: Option<&str>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(session) = session {
+        args.push("--session".into());
+        args.push(session.into());
+    }
+    args.push("status".into());
+    args.push("--json".into());
+    args
+}
+
+#[derive(Deserialize)]
+struct StatusLine {
+    server: Option<StatusServer>,
+}
+
+#[derive(Deserialize)]
+struct StatusServer {
+    version: Option<String>,
+}
+
+/// Whether the daemon behind `status --json` speaks `completion_seq`. Only
+/// the daemon counts: it computes the field, and the CLI prints the
+/// daemon's JSON through untouched. Anything unparseable answers false —
+/// the edge rule is what every older herdr gets anyway.
+pub fn reports_completions(status_output: &str) -> bool {
+    status_output
+        .lines()
+        .rev()
+        .filter(|line| line.trim_start().starts_with('{'))
+        .find_map(|line| serde_json::from_str::<StatusLine>(line.trim()).ok())
+        .and_then(|status| status.server?.version)
+        .and_then(|version| parse_version(&version))
+        .is_some_and(|version| version >= COMPLETION_SEQ_VERSION)
+}
+
+/// Dotted-numeric, tolerant of suffixes ("0.9.2-dev" → 0.9.2), missing
+/// components read as 0 — the app's `HerdrVersion` posture.
+fn parse_version(raw: &str) -> Option<[u64; 3]> {
+    let mut parts = [0u64; 3];
+    let mut any = false;
+    for (slot, part) in parts.iter_mut().zip(raw.trim().split('.')) {
+        let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            break;
+        }
+        *slot = digits.parse().ok()?;
+        any = true;
+    }
+    any.then_some(parts)
+}
+
 pub const ALL_STATUSES: [AgentStatus; 5] = [
     AgentStatus::Idle,
     AgentStatus::Working,
@@ -92,6 +177,9 @@ pub struct AgentInfo {
     pub status: AgentStatus,
     pub name: Option<String>,
     pub agent_kind: Option<String>,
+    /// herdr ≥ 0.9.2: set only while the current idle was reached by
+    /// finishing a turn. Never on the wire to the relay.
+    pub completion_seq: Option<u64>,
 }
 
 impl AgentInfo {
@@ -152,6 +240,7 @@ struct RawAgent {
     agent_status: Option<String>,
     name: Option<String>,
     agent: Option<String>,
+    completion_seq: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -176,6 +265,7 @@ pub fn parse_wait_output(combined: &str) -> WaitOutcome {
                 status: AgentStatus::parse(agent.agent_status.as_deref().unwrap_or("")),
                 name: agent.name,
                 agent_kind: agent.agent,
+                completion_seq: agent.completion_seq,
             });
         }
         if let Some(code) = decoded.error.and_then(|e| e.code) {
@@ -214,6 +304,71 @@ mod tests {
         assert_eq!(report_status(Some(Idle), Working), None);
     }
 
+    fn info(status: AgentStatus, completion_seq: Option<u64>) -> AgentInfo {
+        AgentInfo { status, name: None, agent_kind: None, completion_seq }
+    }
+
+    /// Case for case the app's `theDaemonNamesItsOwnFinishes`
+    /// (HerdrNotifierTests): online and offline must report the same events.
+    #[test]
+    fn the_daemon_names_its_own_finishes() {
+        use AgentStatus::*;
+        let r = |prev: Option<AgentInfo>, cur: AgentInfo| report_transition(prev.as_ref(), &cur, true);
+        // A turn that ended, seen or not, is a finish.
+        assert_eq!(r(Some(info(Working, None)), info(Idle, Some(7))), Some(Done));
+        assert_eq!(r(Some(info(Working, None)), info(Done, Some(7))), Some(Done));
+        // Startup, a restored session and `/new` carry no sequence.
+        assert_eq!(r(Some(info(Working, None)), info(Idle, None)), None);
+        assert_eq!(r(Some(info(Working, None)), info(Done, None)), None);
+        // herdr marking a finish seen keeps its sequence.
+        assert_eq!(r(Some(info(Done, Some(7))), info(Idle, Some(7))), None);
+        // An answered question herdr counts as a finish is one now.
+        assert_eq!(r(Some(info(Blocked, None)), info(Idle, Some(9))), Some(Done));
+        assert_eq!(r(Some(info(Blocked, None)), info(Idle, None)), None);
+        // A finish seen through a detection hiccup still reports.
+        assert_eq!(r(Some(info(Unknown, None)), info(Idle, Some(9))), Some(Done));
+        // Appearing already finished reports; appearing at rest doesn't.
+        assert_eq!(r(None, info(Idle, Some(3))), Some(Done));
+        assert_eq!(r(None, info(Idle, None)), None);
+        // →blocked untouched; →working and →unknown stay non-events.
+        assert_eq!(r(Some(info(Working, None)), info(Blocked, None)), Some(Blocked));
+        assert_eq!(r(None, info(Blocked, None)), Some(Blocked));
+        assert_eq!(r(Some(info(Idle, Some(7))), info(Working, None)), None);
+        assert_eq!(r(Some(info(Working, None)), info(Unknown, None)), None);
+    }
+
+    #[test]
+    fn older_herdr_keeps_the_edge_rule() {
+        use AgentStatus::*;
+        let r = |prev: AgentInfo, cur: AgentInfo| report_transition(Some(&prev), &cur, false);
+        assert_eq!(r(info(Working, None), info(Idle, None)), Some(Done));
+        assert_eq!(r(info(Working, None), info(Done, None)), Some(Done));
+        assert_eq!(r(info(Blocked, None), info(Idle, None)), None);
+        assert_eq!(r(info(Done, None), info(Idle, None)), None);
+    }
+
+    #[test]
+    fn completions_follow_the_daemon_version_alone() {
+        let status = |client: &str, server: &str| format!(
+            "rc noise\n{{\"client\":{{\"version\":\"{client}\",\"protocol\":22}},\"server\":{{\"status\":\"running\",\"running\":true,\"version\":\"{server}\",\"protocol\":22,\"compatible\":true}}}}\n");
+        assert!(reports_completions(&status("0.9.2", "0.9.2")));
+        assert!(reports_completions(&status("0.9.1", "0.9.3")));  // the CLI passes the field through
+        assert!(reports_completions(&status("0.9.2", "0.10.0")));
+        assert!(reports_completions(&status("0.9.2", "0.9.2-dev")));
+        assert!(!reports_completions(&status("0.9.2", "0.9.1")));
+        assert!(!reports_completions(&status("0.8.0", "0.8.0")));
+        // Daemon down (null version), garbage, nothing at all.
+        assert!(!reports_completions(r#"{"client":{"version":"0.9.2"},"server":{"status":"not_running","running":false,"version":null}}"#));
+        assert!(!reports_completions("command not found"));
+        assert!(!reports_completions(""));
+    }
+
+    #[test]
+    fn status_args_shape() {
+        assert_eq!(status_args(Some("dev")), vec!["--session", "dev", "status", "--json"]);
+        assert_eq!(status_args(None), vec!["status", "--json"]);
+    }
+
     #[test]
     fn departure_excludes_current_and_probe_is_all_five() {
         assert_eq!(departure_set(None).len(), 5);
@@ -243,7 +398,17 @@ mod tests {
             WaitOutcome::Status(agent) => {
                 assert_eq!(agent.status, AgentStatus::Blocked);
                 assert_eq!(agent.label(), "api-refactor");
+                assert_eq!(agent.completion_seq, None);
             }
+            other => panic!("expected status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_completion_seq() {
+        let finished = r#"{"result":{"type":"agent_info","agent":{"agent_status":"idle","state_change_seq":12,"completion_seq":12}}}"#;
+        match parse_wait_output(finished) {
+            WaitOutcome::Status(agent) => assert_eq!(agent.completion_seq, Some(12)),
             other => panic!("expected status, got {other:?}"),
         }
     }

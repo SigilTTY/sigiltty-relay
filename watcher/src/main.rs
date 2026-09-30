@@ -1,8 +1,9 @@
 //! sigiltty-watcher — server-side herdr agent watcher for SigilTTY
 //! offline push (docs/PROTOCOL.md; design: SigilTTY ADR-0014). Reads the
 //! app-written config once, watches every target pane on its own thread,
-//! reports the stable transitions `herdr::report_status` admits to the
-//! relay (→blocked, →done, and the seen finish `working → idle`), and dies
+//! reports the stable transitions `herdr::report_transition` admits to the
+//! relay (→blocked, and a finish — herdr's own `completion_seq` on ≥ 0.9.2,
+//! otherwise →done and the seen `working → idle`), and dies
 //! silently at TTL expiry / config removal / persistent failure — the
 //! app's per-connection health check is the only recovery path.
 
@@ -17,7 +18,7 @@ mod seal;
 mod timefmt;
 mod watch;
 
-use herdr::{parse_wait_output, wait_args, AgentStatus, WaitOutcome};
+use herdr::{parse_wait_output, reports_completions, status_args, wait_args, AgentStatus, WaitOutcome};
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,6 +58,16 @@ impl watch::Remote for ProcessRemote {
         combined.push('\n');
         combined.push_str(&String::from_utf8_lossy(&output.stderr));
         parse_wait_output(&combined)
+    }
+
+    /// One `status --json` per run. A spawn failure answers false: the edge
+    /// rule, never a guess that the daemon is new.
+    fn reports_completions(&self) -> bool {
+        Command::new(&self.binary)
+            .args(status_args(self.session.as_deref()))
+            .output()
+            .map(|output| reports_completions(&String::from_utf8_lossy(&output.stdout)))
+            .unwrap_or(false)
     }
 }
 

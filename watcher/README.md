@@ -1,6 +1,6 @@
 # sigiltty-watcher
 
-Rust implementation of the watcher behavior contract ([docs/PROTOCOL.md](../docs/PROTOCOL.md) §9): one thread per target pane runs the level-triggered `herdr agent wait` loop, a 10-second hysteresis window settles herdr's flapping status detector, and the stable transitions the reporting rule admits (`herdr::report_status` — →blocked, →done, and the `working → idle` finish herdr counted as already seen, which travels as `done`) are HPKE-sealed per device and posted to the relay.
+Rust implementation of the watcher behavior contract ([docs/PROTOCOL.md](../docs/PROTOCOL.md) §9): one thread per target pane runs the level-triggered `herdr agent wait` loop, a 10-second hysteresis window settles herdr's flapping status detector, and the stable transitions the reporting rule admits (`herdr::report_transition` — →blocked, and a finish: on herdr ≥ 0.9.2 an idle/done with a new `completion_seq`, before that →done and the `working → idle` finish herdr counted as already seen, which travels as `done`) are HPKE-sealed per device and posted to the relay.
 
 ```bash
 cargo test          # 45 cases: scripted watch loop, CLI parsing, status/uninstall, log cap, HPKE roundtrip, flock, date rendering

@@ -4,10 +4,13 @@
 //! (the app does no client-side filtering; four device-verified failures
 //! stand behind that) — and the awareness model deciding what reports.
 //!
-//! What reports: a STABLE transition the rule in `herdr::report_status`
-//! admits — into blocked or done from anywhere, plus the working → idle
-//! finish herdr believes was already seen — where "stable" means it survived
-//! the hysteresis window. The window is the entire flap defense — so no
+//! What reports: a STABLE transition the rule in `herdr::report_transition`
+//! admits — into blocked from anywhere, plus a finish: on herdr ≥ 0.9.2 an
+//! idle/done carrying a new `completion_seq`, before that any →done and the
+//! working → idle herdr believes was already seen — where "stable" means it
+//! survived the hysteresis window. Which rule applies is probed once per
+//! run (`Remote::reports_completions`); the app restarts the watcher on
+//! every connection, so a herdr upgrade is picked up on the next one. The window is the entire flap defense — so no
 //! further dedup sits on top of it, because the most common real pattern is
 //! blocked → (answered) → working → blocked again, and a "same status as last
 //! time" filter swallows exactly that. Two silences remain: the run's very
@@ -18,11 +21,13 @@
 //! The remote exec is injected, so the whole loop is scripted-unit-tested;
 //! only the process-spawning Remote at the bottom needs a live herdr.
 
-use crate::herdr::{departure_set, report_status, AgentInfo, AgentStatus, WaitOutcome};
+use crate::herdr::{departure_set, report_transition, AgentInfo, AgentStatus, WaitOutcome};
 use std::time::Duration;
 
 pub trait Remote {
     fn wait(&self, until: &[AgentStatus], timeout_ms: u64) -> WaitOutcome;
+    /// Whether the daemon names its own finishes (`herdr::reports_completions`).
+    fn reports_completions(&self) -> bool;
 }
 
 pub struct Timing {
@@ -54,7 +59,7 @@ impl Default for Timing {
 }
 
 pub struct WatchHooks<'a> {
-    /// A stable transition `herdr::report_status` admits. The AgentInfo
+    /// A stable transition `herdr::report_transition` admits. The AgentInfo
     /// carries the status to put ON THE WIRE, which is not always the one
     /// herdr called it (a seen finish travels as `done`).
     pub report: &'a mut dyn FnMut(&AgentInfo),
@@ -67,13 +72,19 @@ pub fn run(remote: &dyn Remote, timing: &Timing, hooks: &mut WatchHooks) {
     // The last STABLE state; None = no agent on the pane (or not yet
     // observed). Transitions are measured against this, never against what
     // was last reported (see the module header).
-    let mut current: Option<AgentStatus> = None;
+    let mut current: Option<AgentInfo> = None;
     let mut seeded = false;
+    let completion_aware = remote.reports_completions();
+    (hooks.log)(if completion_aware {
+        "herdr names its finishes (completion_seq)"
+    } else {
+        "herdr predates completion_seq: edge rule"
+    });
     let mut missing_backoff = timing.missing_start;
     let mut failures: usize = 0;
 
     while (hooks.should_continue)() {
-        let armed = remote.wait(&departure_set(current), timing.wait_timeout_ms);
+        let armed = remote.wait(&departure_set(current.as_ref().map(|a| a.status)), timing.wait_timeout_ms);
         if !(hooks.should_continue)() {
             return;
         }
@@ -86,7 +97,7 @@ pub fn run(remote: &dyn Remote, timing: &Timing, hooks: &mut WatchHooks) {
                 failures = 0;
                 (hooks.log)(&format!(
                     "heartbeat (state: {})",
-                    current.map(|s| s.as_str()).unwrap_or("no agent")));
+                    current.as_ref().map(|a| a.status.as_str()).unwrap_or("no agent")));
             }
             WaitOutcome::Failure(reason) => {
                 if !backoff_or_give_up(&reason, &mut failures, timing, hooks) {
@@ -106,8 +117,7 @@ pub fn run(remote: &dyn Remote, timing: &Timing, hooks: &mut WatchHooks) {
                 match settle(remote, first, timing, hooks) {
                     Settled::Stable(agent) => {
                         let status = agent.status;
-                        let previous = current;
-                        current = Some(status);
+                        let previous = current.replace(agent.clone());
                         if !seeded {
                             // The run's first observation seeds silently: at
                             // deploy time the screen was in front of the user.
@@ -115,14 +125,14 @@ pub fn run(remote: &dyn Remote, timing: &Timing, hooks: &mut WatchHooks) {
                             (hooks.log)(&format!("armed at {}", status.as_str()));
                             continue;
                         }
-                        if previous == Some(status) {
+                        if previous.as_ref().map(|p| p.status) == Some(status) {
                             // Settled back where it started — a flap that
                             // outlived one window but changed nothing.
                             (hooks.log)(&format!("settled back at {}", status.as_str()));
                             continue;
                         }
-                        let from = previous.map(|s| s.as_str()).unwrap_or("none");
-                        match report_status(previous, status) {
+                        let from = previous.as_ref().map(|p| p.status.as_str()).unwrap_or("none");
+                        match report_transition(previous.as_ref(), &agent, completion_aware) {
                             Some(reported) => {
                                 // Says "as done" only when the wire status
                                 // differs from what herdr called it — the
@@ -191,7 +201,7 @@ fn settle(
 /// Missing itself never reports, but it does count as an observation: the
 /// pane's next agent is a new incarnation, so its appearance in a reportable
 /// state IS an event (a hand-started agent blocking on its startup prompt).
-fn apply_missing(current: &mut Option<AgentStatus>, seeded: &mut bool) {
+fn apply_missing(current: &mut Option<AgentInfo>, seeded: &mut bool) {
     *seeded = true;
     *current = None;
 }
@@ -224,13 +234,15 @@ mod tests {
     struct Script {
         responses: RefCell<Vec<WaitOutcome>>,
         calls: RefCell<Vec<(Vec<AgentStatus>, u64)>>,
+        completions: bool,
     }
 
     impl Script {
-        fn new(responses: Vec<WaitOutcome>) -> Script {
+        fn new(responses: Vec<WaitOutcome>, completions: bool) -> Script {
             Script {
                 responses: RefCell::new(responses),
                 calls: RefCell::new(Vec::new()),
+                completions,
             }
         }
     }
@@ -247,10 +259,23 @@ mod tests {
                 responses.remove(0)
             }
         }
+
+        fn reports_completions(&self) -> bool {
+            self.completions
+        }
     }
 
     fn agent(status: AgentStatus) -> WaitOutcome {
-        WaitOutcome::Status(AgentInfo { status, name: Some("api-refactor".into()), agent_kind: Some("claude".into()) })
+        finished(status, None)
+    }
+
+    fn finished(status: AgentStatus, completion_seq: Option<u64>) -> WaitOutcome {
+        WaitOutcome::Status(AgentInfo {
+            status,
+            name: Some("api-refactor".into()),
+            agent_kind: Some("claude".into()),
+            completion_seq,
+        })
     }
 
     fn fast_timing() -> Timing {
@@ -266,7 +291,14 @@ mod tests {
     /// Runs a script to its exhaustion-driven end; returns reported
     /// statuses and the recorded wait calls.
     fn run_script(responses: Vec<WaitOutcome>) -> (Vec<AgentStatus>, Vec<(Vec<AgentStatus>, u64)>) {
-        let script = Script::new(responses);
+        run_script_with(responses, false)
+    }
+
+    fn run_script_with(
+        responses: Vec<WaitOutcome>,
+        completions: bool,
+    ) -> (Vec<AgentStatus>, Vec<(Vec<AgentStatus>, u64)>) {
+        let script = Script::new(responses, completions);
         let reported = RefCell::new(Vec::new());
         let mut report = |info: &AgentInfo| reported.borrow_mut().push(info.status);
         let mut hooks = WatchHooks {
@@ -417,6 +449,33 @@ mod tests {
         ]);
         assert_eq!(calls[2].0, calls[3].0);
         assert_eq!(calls[3].1, 300);
+    }
+
+    /// herdr ≥ 0.9.2: a restored or freshly started agent settling from
+    /// working to idle carries no `completion_seq` — no push. A real turn's
+    /// end does, and the user then looking at it (`done → idle`, same
+    /// sequence) stays silent.
+    #[test]
+    fn the_daemon_decides_what_a_finish_is() {
+        let (reported, _) = run_script_with(vec![
+            agent(Working), WaitOutcome::TimedOut,              // seed: working (startup)
+            agent(Idle), WaitOutcome::TimedOut,                 // startup settles — no sequence
+            agent(Working), WaitOutcome::TimedOut,              // a real turn
+            finished(Done, Some(9)), WaitOutcome::TimedOut,     // ends, unseen → reports
+            finished(Idle, Some(9)), WaitOutcome::TimedOut,     // the user looked
+        ], true);
+        assert_eq!(reported, vec![Done]);
+    }
+
+    /// The seed's sequence counts as seen: a watcher restarted onto a
+    /// pending finish must not push it again once herdr marks it seen.
+    #[test]
+    fn a_seeded_finish_is_not_reported_when_marked_seen() {
+        let (reported, _) = run_script_with(vec![
+            finished(Done, Some(4)), WaitOutcome::TimedOut,     // seed
+            finished(Idle, Some(4)), WaitOutcome::TimedOut,     // marked seen
+        ], true);
+        assert_eq!(reported, Vec::<AgentStatus>::new());
     }
 
     #[test]
